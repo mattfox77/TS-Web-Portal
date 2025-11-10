@@ -1,0 +1,31 @@
+We discussed 3 goals:
+Comparing 2 estimates for differences (Levelr has similar functionality)
+Converting Estimates into Xactimate (ClaimsFlow offers similar)
+Evaluating estimates and recommending improvements - line items, rate and fee maximization and reliable pricing  (Xactimate Application insights is similar)
+
+Ill start researching these goals and provide more information. 
+We will need to identify example documents for testing functionality 
+I will see what examples I can find online. 
+
+Can you provide an example of 2 different estimates for a project, an Xactimate Estimate export, and an example of an estimate that has been converted to Xactimate, including the before and after (Xactimate export vs Report)
+
+Talk to you soon!
+Matt
+
+
+
+Daniel de Sailles <support@topshelfestimates.com>
+Attachments
+Thu, Sep 4, 1:08 PM
+to me
+
+1. https://www.getlevlr.com/
+2. https://www.claimsflow.io/
+3. https://getinsights.org/
+--
+Daniel de Sailles
+Top Shelf Estimates
+http://www.topshelfestimates.com
+Professional Xactimate Estimates
+Fast - Reliable - Affordable
+Questions? Call Me! (909) 235-6699

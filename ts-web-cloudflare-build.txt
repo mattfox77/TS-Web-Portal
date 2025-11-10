@@ -1,0 +1,1338 @@
+Step 1: Initial Setup
+bash# Create Next.js project
+npx create-next-app@latest client-portal
+# Select: Yes to TypeScript, Yes to App Router, Yes to Tailwind CSS
+
+cd client-portal
+
+# Install dependencies
+npm install @clerk/nextjs
+npm install @cloudflare/next-on-pages
+npm install wrangler -D
+Step 2: Set Up Clerk Authentication
+
+Go to clerk.com and create a free account
+Create a new application (name it "Client Portal")
+Copy your API keys
+
+Add to .env.local:
+bashNEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_xxxxxxxxxxxxx
+CLERK_SECRET_KEY=sk_test_xxxxxxxxxxxxx
+Update app/layout.tsx:
+typescriptimport { ClerkProvider } from '@clerk/nextjs'
+import './globals.css'
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <ClerkProvider>
+      <html lang="en">
+        <body>{children}</body>
+      </html>
+    </ClerkProvider>
+  )
+}
+Step 3: Set Up Cloudflare D1 Database
+bash# Login to Cloudflare
+npx wrangler login
+
+# Create D1 database
+npx wrangler d1 create client-portal-db
+
+# You'll get output like:
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "client-portal-db"
+# database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+Create wrangler.toml in project root:
+tomlname = "client-portal"
+compatibility_date = "2024-01-01"
+pages_build_output_dir = ".vercel/output/static"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "client-portal-db"
+database_id = "YOUR_DATABASE_ID_FROM_ABOVE"
+
+[[r2_buckets]]
+binding = "DOCUMENTS"
+bucket_name = "client-portal-documents"
+
+[vars]
+ENVIRONMENT = "production"
+Create database schema - schema.sql:
+sql-- Clients table
+CREATE TABLE clients (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  company_name TEXT,
+  status TEXT DEFAULT 'active',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Users table (links Clerk users to clients)
+CREATE TABLE users (
+  id TEXT PRIMARY KEY, -- Clerk user ID
+  client_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  first_name TEXT,
+  last_name TEXT,
+  role TEXT DEFAULT 'user', -- admin, user
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (client_id) REFERENCES clients(id)
+);
+
+-- Products table
+CREATE TABLE products (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  status TEXT DEFAULT 'development', -- development, testing, production, maintenance
+  github_repo TEXT,
+  sentry_project_id TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (client_id) REFERENCES clients(id)
+);
+
+-- Support tickets table
+CREATE TABLE tickets (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  product_id TEXT,
+  user_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT DEFAULT 'open', -- open, in_progress, closed
+  priority TEXT DEFAULT 'medium', -- low, medium, high, urgent
+  github_issue_number INTEGER,
+  github_issue_url TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (client_id) REFERENCES clients(id),
+  FOREIGN KEY (product_id) REFERENCES products(id),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- API usage tracking table
+CREATE TABLE api_usage (
+  id TEXT PRIMARY KEY,
+  product_id TEXT NOT NULL,
+  provider TEXT NOT NULL, -- 'openai', 'anthropic'
+  model TEXT NOT NULL,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  total_tokens INTEGER DEFAULT 0,
+  cost_usd REAL DEFAULT 0,
+  request_timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+-- Documents table
+CREATE TABLE documents (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  product_id TEXT,
+  filename TEXT NOT NULL,
+  file_size INTEGER,
+  file_type TEXT,
+  storage_key TEXT NOT NULL, -- R2 key
+  uploaded_by TEXT NOT NULL,
+  uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (client_id) REFERENCES clients(id),
+  FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+-- Sentry errors table
+CREATE TABLE sentry_errors (
+  id TEXT PRIMARY KEY,
+  product_id TEXT NOT NULL,
+  error_title TEXT NOT NULL,
+  error_message TEXT,
+  error_count INTEGER DEFAULT 1,
+  sentry_url TEXT,
+  first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+  last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+-- Create indexes for better query performance
+CREATE INDEX idx_users_client_id ON users(client_id);
+CREATE INDEX idx_products_client_id ON products(client_id);
+CREATE INDEX idx_tickets_client_id ON tickets(client_id);
+CREATE INDEX idx_tickets_status ON tickets(status);
+CREATE INDEX idx_api_usage_product_id ON api_usage(product_id);
+CREATE INDEX idx_api_usage_timestamp ON api_usage(request_timestamp);
+CREATE INDEX idx_documents_client_id ON documents(client_id);
+Initialize the database:
+bash# Apply schema to local database (for testing)
+npx wrangler d1 execute client-portal-db --local --file=./schema.sql
+
+# Apply schema to production database
+npx wrangler d1 execute client-portal-db --remote --file=./schema.sql
+Step 4: Create R2 Bucket for Documents
+bash# Create R2 bucket
+npx wrangler r2 bucket create client-portal-documents
+Step 5: Build the Application Structure
+Create lib/db.ts - Database utilities:
+typescriptexport interface Env {
+  DB: D1Database;
+  DOCUMENTS: R2Bucket;
+  GITHUB_TOKEN: string;
+  SENTRY_TOKEN: string;
+}
+
+export async function getClientByUserId(db: D1Database, userId: string) {
+  const result = await db
+    .prepare('SELECT client_id FROM users WHERE id = ?')
+    .bind(userId)
+    .first();
+  return result?.client_id;
+}
+
+export async function createClient(db: D1Database, data: {
+  id: string;
+  name: string;
+  email: string;
+  company_name?: string;
+}) {
+  return await db
+    .prepare(
+      'INSERT INTO clients (id, name, email, company_name) VALUES (?, ?, ?, ?)'
+    )
+    .bind(data.id, data.name, data.email, data.company_name || null)
+    .run();
+}
+
+export async function createUser(db: D1Database, data: {
+  id: string;
+  client_id: string;
+  email: string;
+  first_name?: string;
+  last_name?: string;
+  role?: string;
+}) {
+  return await db
+    .prepare(
+      'INSERT INTO users (id, client_id, email, first_name, last_name, role) VALUES (?, ?, ?, ?, ?, ?)'
+    )
+    .bind(
+      data.id,
+      data.client_id,
+      data.email,
+      data.first_name || null,
+      data.last_name || null,
+      data.role || 'user'
+    )
+    .run();
+}
+Create lib/pricing.ts - API cost calculator:
+typescriptexport function calculateOpenAICost(model: string, tokens: number): number {
+  const prices: Record<string, number> = {
+    'gpt-4': 0.00003,
+    'gpt-4-turbo': 0.00001,
+    'gpt-3.5-turbo': 0.000001,
+  };
+  return (tokens / 1000) * (prices[model] || 0);
+}
+
+export function calculateAnthropicCost(
+  model: string,
+  inputTokens: number,
+  outputTokens: number
+): number {
+  const prices: Record<string, { input: number; output: number }> = {
+    'claude-sonnet-4-5': { input: 0.000003, output: 0.000015 },
+    'claude-opus-4': { input: 0.000015, output: 0.000075 },
+    'claude-3-5-sonnet': { input: 0.000003, output: 0.000015 },
+  };
+  
+  const price = prices[model] || { input: 0, output: 0 };
+  return (
+    (inputTokens / 1000) * price.input +
+    (outputTokens / 1000) * price.output
+  );
+}
+Step 6: Create API Routes
+Create app/api/clients/route.ts:
+typescriptimport { auth } from '@clerk/nextjs';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+
+export const runtime = 'edge';
+
+export async function GET(request: NextRequest) {
+  try {
+    const { userId } = auth();
+    
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    // Get user's client
+    const result = await db
+      .prepare('SELECT c.* FROM clients c JOIN users u ON c.id = u.client_id WHERE u.id = ?')
+      .bind(userId)
+      .first();
+
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error('Error fetching client:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+Create app/api/products/route.ts:
+typescriptimport { auth } from '@clerk/nextjs';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+
+export const runtime = 'edge';
+
+export async function GET(request: NextRequest) {
+  try {
+    const { userId } = auth();
+    
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    // Get client_id for this user
+    const user = await db
+      .prepare('SELECT client_id FROM users WHERE id = ?')
+      .bind(userId)
+      .first();
+
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+
+    // Get all products for this client
+    const { results } = await db
+      .prepare('SELECT * FROM products WHERE client_id = ? ORDER BY created_at DESC')
+      .bind(user.client_id)
+      .all();
+
+    return NextResponse.json(results);
+  } catch (error) {
+    console.error('Error fetching products:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+Create app/api/tickets/route.ts:
+typescriptimport { auth } from '@clerk/nextjs';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+
+export const runtime = 'edge';
+
+export async function GET(request: NextRequest) {
+  try {
+    const { userId } = auth();
+    
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    // Get client_id for this user
+    const user = await db
+      .prepare('SELECT client_id FROM users WHERE id = ?')
+      .bind(userId)
+      .first();
+
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+
+    // Get all tickets for this client
+    const { results } = await db
+      .prepare(`
+        SELECT t.*, p.name as product_name 
+        FROM tickets t
+        LEFT JOIN products p ON t.product_id = p.id
+        WHERE t.client_id = ?
+        ORDER BY t.created_at DESC
+      `)
+      .bind(user.client_id)
+      .all();
+
+    return NextResponse.json(results);
+  } catch (error) {
+    console.error('Error fetching tickets:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const { userId } = auth();
+    
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    // Get client_id for this user
+    const user = await db
+      .prepare('SELECT client_id FROM users WHERE id = ?')
+      .bind(userId)
+      .first();
+
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+
+    const body = await request.json();
+    const { title, description, product_id, priority = 'medium' } = body;
+
+    // Create ticket
+    const ticketId = crypto.randomUUID();
+    await db
+      .prepare(`
+        INSERT INTO tickets (id, client_id, product_id, user_id, title, description, priority)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .bind(ticketId, user.client_id, product_id || null, userId, title, description, priority)
+      .run();
+
+    // Get product details for GitHub integration
+    let githubIssueUrl = null;
+    if (product_id) {
+      const product = await db
+        .prepare('SELECT github_repo FROM products WHERE id = ?')
+        .bind(product_id)
+        .first();
+
+      if (product?.github_repo && env.GITHUB_TOKEN) {
+        // Create GitHub issue
+        try {
+          const [owner, repo] = product.github_repo.split('/');
+          const githubResponse = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/issues`,
+            {
+              method: 'POST',
+              headers: {
+                'Authorization': `token ${env.GITHUB_TOKEN}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Client-Portal'
+              },
+              body: JSON.stringify({
+                title: `[Support] ${title}`,
+                body: `${description}\n\n---\nTicket ID: ${ticketId}\nPriority: ${priority}`,
+                labels: ['support', priority]
+              })
+            }
+          );
+
+          if (githubResponse.ok) {
+            const issue = await githubResponse.json();
+            githubIssueUrl = issue.html_url;
+
+            // Update ticket with GitHub issue info
+            await db
+              .prepare(`
+                UPDATE tickets 
+                SET github_issue_number = ?, github_issue_url = ?
+                WHERE id = ?
+              `)
+              .bind(issue.number, githubIssueUrl, ticketId)
+              .run();
+          }
+        } catch (githubError) {
+          console.error('Error creating GitHub issue:', githubError);
+        }
+      }
+    }
+
+    return NextResponse.json({ 
+      id: ticketId,
+      github_issue_url: githubIssueUrl 
+    }, { status: 201 });
+  } catch (error) {
+    console.error('Error creating ticket:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+Create app/api/usage/route.ts:
+typescriptimport { auth } from '@clerk/nextjs';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+import { calculateOpenAICost, calculateAnthropicCost } from '@/lib/pricing';
+
+export const runtime = 'edge';
+
+// Track API usage
+export async function POST(request: NextRequest) {
+  try {
+    const { userId } = auth();
+    
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    const body = await request.json();
+    const { product_id, provider, model, input_tokens = 0, output_tokens = 0 } = body;
+
+    // Calculate cost
+    let cost = 0;
+    if (provider === 'openai') {
+      cost = calculateOpenAICost(model, input_tokens + output_tokens);
+    } else if (provider === 'anthropic') {
+      cost = calculateAnthropicCost(model, input_tokens, output_tokens);
+    }
+
+    // Save usage
+    const usageId = crypto.randomUUID();
+    await db
+      .prepare(`
+        INSERT INTO api_usage (id, product_id, provider, model, input_tokens, output_tokens, total_tokens, cost_usd)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .bind(
+        usageId,
+        product_id,
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        input_tokens + output_tokens,
+        cost
+      )
+      .run();
+
+    return NextResponse.json({ 
+      tracked: true, 
+      cost,
+      id: usageId 
+    });
+  } catch (error) {
+    console.error('Error tracking usage:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+
+// Get usage stats
+export async function GET(request: NextRequest) {
+  try {
+    const { userId } = auth();
+    
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+    
+    const { searchParams } = new URL(request.url);
+    const product_id = searchParams.get('product_id');
+    const days = parseInt(searchParams.get('days') || '30');
+
+    // Get client_id for this user
+    const user = await db
+      .prepare('SELECT client_id FROM users WHERE id = ?')
+      .bind(userId)
+      .first();
+
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+
+    let query = `
+      SELECT 
+        DATE(request_timestamp) as date,
+        provider,
+        model,
+        SUM(total_tokens) as total_tokens,
+        SUM(cost_usd) as total_cost,
+        COUNT(*) as request_count
+      FROM api_usage au
+      JOIN products p ON au.product_id = p.id
+      WHERE p.client_id = ?
+        AND request_timestamp >= datetime('now', '-${days} days')
+    `;
+
+    const bindings: any[] = [user.client_id];
+
+    if (product_id) {
+      query += ' AND au.product_id = ?';
+      bindings.push(product_id);
+    }
+
+    query += ' GROUP BY DATE(request_timestamp), provider, model ORDER BY date DESC';
+
+    const { results } = await db.prepare(query).bind(...bindings).all();
+
+    // Calculate totals
+    const totals = results.reduce(
+      (acc: any, row: any) => {
+        acc.total_tokens += row.total_tokens || 0;
+        acc.total_cost += row.total_cost || 0;
+        acc.total_requests += row.request_count || 0;
+        return acc;
+      },
+      { total_tokens: 0, total_cost: 0, total_requests: 0 }
+    );
+
+    return NextResponse.json({
+      usage: results,
+      totals
+    });
+  } catch (error) {
+    console.error('Error fetching usage:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+Create app/api/webhooks/github/route.ts:
+typescriptimport { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+
+export const runtime = 'edge';
+
+export async function POST(request: NextRequest) {
+  try {
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    const body = await request.json();
+    const { action, issue, repository } = body;
+
+    console.log('GitHub webhook received:', action, issue?.number);
+
+    if (action === 'closed' && issue) {
+      // Update ticket status when GitHub issue is closed
+      await db
+        .prepare(`
+          UPDATE tickets 
+          SET status = 'closed', updated_at = CURRENT_TIMESTAMP
+          WHERE github_issue_number = ?
+        `)
+        .bind(issue.number)
+        .run();
+    } else if (action === 'reopened' && issue) {
+      // Reopen ticket
+      await db
+        .prepare(`
+          UPDATE tickets 
+          SET status = 'open', updated_at = CURRENT_TIMESTAMP
+          WHERE github_issue_number = ?
+        `)
+        .bind(issue.number)
+        .run();
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error('Error processing GitHub webhook:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+Create app/api/webhooks/sentry/route.ts:
+typescriptimport { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+
+export const runtime = 'edge';
+
+export async function POST(request: NextRequest) {
+  try {
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    const body = await request.json();
+    const { action, data } = body;
+
+    console.log('Sentry webhook received:', action);
+
+    if (action === 'issue.created' || action === 'event.alert') {
+      const issue = data.issue || data.event;
+      
+      // Find product by Sentry project ID
+      const product = await db
+        .prepare('SELECT id FROM products WHERE sentry_project_id = ?')
+        .bind(data.project)
+        .first();
+
+      if (product) {
+        const errorId = crypto.randomUUID();
+        await db
+          .prepare(`
+            INSERT INTO sentry_errors 
+            (id, product_id, error_title, error_message, error_count, sentry_url)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `)
+          .bind(
+            errorId,
+            product.id,
+            issue.title || 'Unknown error',
+            issue.message || '',
+            issue.count || 1,
+            issue.permalink || ''
+          )
+          .run();
+      }
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error('Error processing Sentry webhook:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+Create app/api/webhooks/clerk/route.ts - Sync Clerk users to database:
+typescriptimport { Webhook } from 'svix';
+import { headers } from 'next/headers';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRequestContext } from '@cloudflare/next-on-pages';
+
+export const runtime = 'edge';
+
+export async function POST(request: NextRequest) {
+  try {
+    const WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
+
+    if (!WEBHOOK_SECRET) {
+      throw new Error('Missing CLERK_WEBHOOK_SECRET');
+    }
+
+    const headerPayload = headers();
+    const svix_id = headerPayload.get('svix-id');
+    const svix_timestamp = headerPayload.get('svix-timestamp');
+    const svix_signature = headerPayload.get('svix-signature');
+
+    if (!svix_id || !svix_timestamp || !svix_signature) {
+      return NextResponse.json(
+        { error: 'Missing svix headers' },
+        { status: 400 }
+      );
+    }
+
+    const payload = await request.text();
+    const body = JSON.parse(payload);
+
+    const wh = new Webhook(WEBHOOK_SECRET);
+    const evt = wh.verify(payload, {
+      'svix-id': svix_id,
+      'svix-timestamp': svix_timestamp,
+      'svix-signature': svix_signature,
+    }) as any;
+
+    const { env } = getRequestContext();
+    const db = env.DB;
+
+    // Handle user.created event
+    if (evt.type === 'user.created') {
+      const { id, email_addresses, first_name, last_name, public_metadata } = evt.data;
+      
+      // Check if user has a client_id in metadata
+      let clientId = public_metadata?.client_id;
+      
+      // If no client_id, create a new client
+      if (!clientId) {
+        clientId = crypto.randomUUID();
+        const email = email_addresses[0]?.email_address;
+        
+        await db
+          .prepare(
+            'INSERT INTO clients (id, name, email) VALUES (?, ?, ?)'
+          )
+          .bind(clientId, `${first_name || ''} ${last_name || ''}`.trim() || email, email)
+          .run();
+      }
+
+      // Create user record
+      await db
+        .prepare(`
+          INSERT INTO users (id, client_id, email, first_name, last_name)
+          VALUES (?, ?, ?, ?, ?)
+        `)
+        .bind(
+          id,
+          clientId,
+          email_addresses[0]?.email_address,
+          first_name || null,
+          last_name || null
+        )
+        .run();
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error('Error processing Clerk webhook:', error);
+    return NextResponse.json(
+      { error: 'Webhook processing failed' },
+      { status: 500 }
+    );
+  }
+}
+Step 7: Build Frontend Pages
+Create app/page.tsx - Landing page:
+typescriptimport { auth } from '@clerk/nextjs';
+import { redirect } from 'next/navigation';
+import Link from 'next/link';
+
+export default async function Home() {
+  const { userId } = auth();
+  
+  if (userId) {
+    redirect('/dashboard');
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100">
+      <div className="text-center">
+        <h1 className="text-6xl font-bold text-gray-900 mb-4">
+          Client Portal
+        </h1>
+        <p className="text-xl text-gray-600 mb-8">
+          Manage your applications, support tickets, and usage
+        </p>
+        <div className="space-x-4">
+          <Link
+            href="/sign-in"
+            className="inline-block px-8 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+          >
+            Sign In
+          </Link>
+          <Link
+            href="/sign-up"
+            className="inline-block px-8 py-3 bg-white text-blue-600 border-2 border-blue-600 rounded-lg hover:bg-blue-50 transition"
+          >
+            Sign Up
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+}
+Create app/sign-in/[[...sign-in]]/page.tsx:
+typescriptimport { SignIn } from '@clerk/nextjs';
+
+export default function SignInPage() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <SignIn afterSignInUrl="/dashboard" />
+    </div>
+  );
+}
+Create app/sign-up/[[...sign-up]]/page.tsx:
+typescriptimport { SignUp } from '@clerk/nextjs';
+
+export default function SignUpPage() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <SignUp afterSignUpUrl="/dashboard" />
+    </div>
+  );
+}
+Create app/dashboard/page.tsx:
+typescriptimport { auth, currentUser } from '@clerk/nextjs';
+import { redirect } from 'next/navigation';
+import Link from 'next/link';
+import { UserButton } from '@clerk/nextjs';
+
+export default async function DashboardPage() {
+  const { userId } = auth();
+  const user = await currentUser();
+  
+  if (!userId) {
+    redirect('/sign-in');
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Header */}
+      <header className="bg-white shadow">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-gray-900">Client Portal</h1>
+          <div className="flex items-center space-x-4">
+            <span className="text-sm text-gray-600">
+              {user?.firstName} {user?.lastName}
+            </span>
+            <UserButton afterSignOutUrl="/" />
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="mb-8">
+          <h2 className="text-3xl font-bold text-gray-900 mb-2">
+            Welcome back, {user?.firstName}!
+          </h2>
+          <p className="text-gray-600">
+            Manage your applications and support requests
+          </p>
+        </div>
+
+        {/* Quick Actions Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+          <QuickActionCard
+            title="Products"
+            description="View your applications"
+            href="/dashboard/products"
+            icon="📦"
+          />
+          <QuickActionCard
+            title="Support Tickets"
+            description="Manage support requests"
+            href="/dashboard/tickets"
+            icon="🎫"
+          />
+          <QuickActionCard
+            title="API Usage"
+            description="Monitor usage & costs"
+            href="/dashboard/usage"
+            icon="📊"
+          />
+          <QuickActionCard
+            title="Documents"
+            description="Access your files"
+            href="/dashboard/documents"
+            icon="📄"
+          />
+        </div>
+
+        {/* Recent Activity */}
+        <div className="bg-white rounded-lg shadow p-6">
+          <h3 className="text-xl font-semibold mb-4">Recent Activity</h3>
+          <p className="text-gray-500">No recent activity to display</p>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function QuickActionCard({ title, description, href, icon }: {
+  title: string;
+  description: string;
+  href: string;
+  icon: string;
+}) {
+  return (
+    <Link
+      href={href}
+      className="block p-6 bg-white rounded-lg shadow hover:shadow-lg transition transform hover:-translate-y-1"
+    >
+      <div className="text-4xl mb-3">{icon}</div>
+      <h3 className="text-lg font-semibold text-gray-900 mb-1">{title}</h3>
+      <p className="text-sm text-gray-600">{description}</p>
+    </Link>
+  );
+}
+Create app/dashboard/tickets/page.tsx:
+typescript'use client';
+
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
+
+export default function TicketsPage() {
+  const [tickets, setTickets] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch('/api/tickets')
+      .then(res => res.json())
+      .then(data => {
+        setTickets(data);
+        setLoading(false);
+      });
+  }, []);
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="flex justify-between items-center mb-8">
+          <div>
+            <Link href="/dashboard" className="text-blue-600 hover:underline mb-2 block">
+              ← Back to Dashboard
+            </Link>
+            <h1 className="text-3xl font-bold text-gray-900">Support Tickets</h1>
+          </div>
+          <Link
+            href="/dashboard/tickets/new"
+            className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+          >
+            New Ticket
+          </Link>
+        </div>
+
+        <div className="bg-white rounded-lg shadow overflow-hidden">
+          {tickets.length === 0 ? (
+            <div className="p-8 text-center text-gray-500">
+              No tickets yet. Create your first support ticket!
+            </div>
+          ) : (
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Title
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Product
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Priority
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Created
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {tickets.map((ticket: any) => (
+                  <tr key={ticket.id} className="hover:bg-gray-50">
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="text-sm font-medium text-gray-900">{ticket.title}</div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="text-sm text-gray-500">{ticket.product_name || 'N/A'}</div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                        ticket.status === 'open' ? 'bg-green-100 text-green-800' :
+                        ticket.status === 'in_progress' ? 'bg-yellow-100 text-yellow-800' :
+                        'bg-gray-100 text-gray-800'
+                      }`}>
+                        {ticket.status}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                        ticket.priority === 'urgent' ? 'bg-red-100 text-red-800' :
+                        ticket.priority === 'high' ? 'bg-orange-100 text-orange-800' :
+                        ticket.priority === 'medium' ? 'bg-blue-100 text-blue-800' :
+                        'bg-gray-100 text-gray-800'
+                      }`}>
+                        {ticket.priority}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {new Date(ticket.created_at).toLocaleDateString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+Create app/dashboard/tickets/new/page.tsx:
+typescript'use client';
+
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+
+export default function NewTicketPage() {
+  const router = useRouter();
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [formData, setFormData] = useState({
+    title: '',
+    description: '',
+    product_id: '',
+    priority: 'medium'
+  });
+
+  useEffect(() => {
+    fetch('/api/products')
+      .then(res => res.json())
+      .then(data => setProducts(data));
+  }, []);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setLoading(true);
+
+    try {
+      const response = await fetch('/api/tickets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      });
+
+      if (response.ok) {
+        router.push('/dashboard/tickets');
+      }
+    } catch (error) {
+      console.error('Error creating ticket:', error);
+      alert('Failed to create ticket');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <Link href="/dashboard/tickets" className="text-blue-600 hover:underline mb-4 block">
+          ← Back to Tickets
+        </Link>
+        
+        <h1 className="text-3xl font-bold text-gray-900 mb-8">Create Support Ticket</h1>
+
+        <form onSubmit={handleSubmit} className="bg-white rounded-lg shadow p-6 space-y-6">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Title *
+            </label>
+            <input
+              type="text"
+              required
+              value={formData.title}
+              onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="Brief description of the issue"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Description *
+            </label>
+            <textarea
+              required
+              value={formData.description}
+              onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+              rows={6}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="Detailed description of the issue"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Product
+            </label>
+            <select
+              value={formData.product_id}
+              onChange={(e) => setFormData({ ...formData, product_id: e.target.value })}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              <option value="">Select a product (optional)</option>
+              {products.map((product: any) => (
+                <option key={product.id} value={product.id}>
+                  {product.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Priority
+            </label>
+            <select
+              value={formData.priority}
+              onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="urgent">Urgent</option>
+            </select>
+          </div>
+
+          <div className="flex justify-end space-x-4">
+            <Link
+              href="/dashboard/tickets"
+              className="px-6 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition"
+            >
+              Cancel
+            </Link>
+            <button
+              type="submit"
+              disabled={loading}
+              className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50"
+            >
+              {loading ? 'Creating...' : 'Create Ticket'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+Step 8: Configure for Cloudflare Pages
+Update next.config.js:
+javascript/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Required for Cloudflare Pages
+  experimental: {
+    runtime: 'experimental-edge',
+  },
+}
+
+module.exports = nextConfig
+Create .dev.vars for local development:
+bashGITHUB_TOKEN=your_github_token_here
+SENTRY_TOKEN=your_sentry_token_here
+CLERK_WEBHOOK_SECRET=your_clerk_webhook_secret
+Step 9: Deploy to Cloudflare
+bash# Build the project
+npm run build
+
+# Deploy to Cloudflare Pages
+npx wrangler pages deploy .vercel/output/static --project-name=client-portal
+
+# Set environment variables in Cloudflare dashboard:
+# - GITHUB_TOKEN
+# - SENTRY_TOKEN  
+# - CLERK_WEBHOOK_SECRET
+# - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+# - CLERK_SECRET_KEY
+Or use Cloudflare Dashboard:
+
+Go to Workers & Pages
+Click "Create Application"
+Connect your GitHub repo
+Set build command: npm run build
+Set environment variables
+
+Step 10: Set Up Webhooks
+GitHub Webhook:
+
+Go to your GitHub repo → Settings → Webhooks
+Add webhook URL: https://your-site.pages.dev/api/webhooks/github
+Select events: Issues
+Save
+
+Sentry Webhook:
+
+Go to Sentry → Settings → Developer Settings → Webhooks
+Add URL: https://your-site.pages.dev/api/webhooks/sentry
+Enable events: Issue and Error
+Save
+
+Clerk Webhook:
+
+Go to Clerk Dashboard → Webhooks
+Add endpoint: https://your-site.pages.dev/api/webhooks/clerk
+Subscribe to user.created
+Copy webhook secret to .env.local and Cloudflare
+
+Step 11: Add Sample Data (Optional)
+Create seed.sql to add test data:
+sql-- Sample client
+INSERT INTO clients (id, name, email, company_name, status)
+VALUES ('client-1', 'John Doe', 'john@example.com', 'Example Corp', 'active');
+
+-- Sample product
+INSERT INTO products (id, client_id, name, description, status, github_repo)
+VALUES (
+  'prod-1',
+  'client-1',
+  'Real Estate Data Extractor',
+  'AI-powered document extraction tool',
+  'production',
+  'yourusername/real-estate-app'
+);
+Apply seed data:
+bashnpx wrangler d1 execute client-portal-db --remote --file=./seed.sql
+Step 12: Track Usage from Your Python App
+Add this to your Python app to track API usage:
+pythonimport requests
+
+def track_api_usage(product_id: str, provider: str, model: str, input_tokens: int, output_tokens: int):
+    """Track API usage to client portal"""
+    try:
+        requests.post(
+            'https://your-site.pages.dev/api/usage',
+            json={
+                'product_id': product_id,
+                'provider': provider,
+                'model': model,
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens
+            },
+            headers={'Authorization': f'Bearer {YOUR_API_KEY}'}
+        )
+    except Exception as e:
+        print(f'Failed to track usage: {e}')
+
+# Usage example
+response = client.messages.create(
+    model="claude-sonnet-4-5-20250929",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}]
+)
+
+# Track the usage
+track_api_usage(
+    product_id='prod-1',
+    provider='anthropic',
+    model='claude-sonnet-4-5',
+    input_tokens=response.usage.input_tokens,
+    output_tokens=response.usage.output_tokens
+)
+
+What You've Built:
+✅ Full client portal with authentication
+✅ Product management
+✅ Support ticket system with GitHub integration
+✅ API usage tracking with cost calculation
+✅ Sentry error tracking integration
+✅ Document storage ready (R2)
+✅ Webhooks for GitHub, Sentry, and Clerk
+✅ All running on Cloudflare's free tier!
+Next steps:
+
+Test locally: npm run dev
+Deploy to Cloudflare
+Set up webhooks
+Add your client data
+Integrate with your Python apps
