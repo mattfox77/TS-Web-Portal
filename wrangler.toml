@@ -1,0 +1,36 @@
+name = "tech-support-client-portal"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = ".vercel/output/static"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "tech-support-db"
+database_id = "your-database-id-here"
+
+# R2 Storage binding for documents
+[[r2_buckets]]
+binding = "DOCUMENTS"
+bucket_name = "tech-support-documents"
+
+# Environment variables (secrets should be set via wrangler secret put)
+[vars]
+PAYPAL_MODE = "sandbox"
+
+# Note: Cron triggers are not supported for Pages projects
+# Use Cloudflare Workers for scheduled tasks if needed
+
+# Production environment configuration
+[env.production]
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "tech-support-db-production"
+database_id = "3fc6b4b5-675d-43bd-9a68-6246910c3d39"
+
+[[env.production.r2_buckets]]
+binding = "DOCUMENTS"
+bucket_name = "tech-support-documents-production"
+
+[env.production.vars]
+PAYPAL_MODE = "live"

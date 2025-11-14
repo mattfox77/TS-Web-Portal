@@ -1,0 +1,204 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+@layer base {
+  /* Ensure minimum touch target size of 44px for mobile */
+  button,
+  a,
+  input[type="button"],
+  input[type="submit"],
+  input[type="reset"] {
+    @apply min-h-[44px] min-w-[44px];
+  }
+  
+  /* Improve text readability on mobile */
+  body {
+    @apply text-base leading-relaxed;
+  }
+  
+  /* Prevent horizontal scroll on mobile */
+  html,
+  body {
+    @apply overflow-x-hidden;
+  }
+}
+
+@layer components {
+  /* Mobile-friendly card component */
+  .card-mobile {
+    @apply rounded-lg border bg-white p-4 shadow-sm;
+    @apply sm:p-6;
+  }
+  
+  /* Mobile-friendly button */
+  .btn-mobile {
+    @apply inline-flex items-center justify-center rounded-md px-4 py-3;
+    @apply text-sm font-medium transition-colors;
+    @apply focus:outline-none focus:ring-2 focus:ring-offset-2;
+    @apply active:scale-95;
+  }
+  
+  /* Mobile-friendly input */
+  .input-mobile {
+    @apply w-full rounded-md border border-gray-300 px-4 py-3;
+    @apply text-base focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500;
+  }
+  
+  /* Mobile-friendly table wrapper */
+  .table-mobile-wrapper {
+    @apply -mx-4 overflow-x-auto sm:mx-0 sm:rounded-lg;
+  }
+  
+  /* Mobile-friendly navigation */
+  .nav-mobile {
+    @apply fixed bottom-0 left-0 right-0 z-50 border-t bg-white;
+    @apply sm:static sm:border-0;
+  }
+  
+  /* Responsive container */
+  .container-responsive {
+    @apply mx-auto w-full px-4;
+    @apply sm:px-6 lg:px-8;
+    @apply max-w-7xl;
+  }
+  
+  /* Mobile-friendly grid */
+  .grid-mobile {
+    @apply grid grid-cols-1 gap-4;
+    @apply sm:grid-cols-2 sm:gap-6;
+    @apply lg:grid-cols-3;
+  }
+  
+  /* Stack on mobile, row on desktop */
+  .stack-mobile {
+    @apply flex flex-col gap-4;
+    @apply sm:flex-row sm:items-center;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  
+  /* Touch-friendly spacing */
+  .touch-spacing {
+    @apply space-y-4 sm:space-y-6;
+  }
+  
+  /* Hide on mobile, show on desktop */
+  .hide-mobile {
+    @apply hidden sm:block;
+  }
+  
+  /* Show on mobile, hide on desktop */
+  .show-mobile {
+    @apply block sm:hidden;
+  }
+  
+  /* Responsive text sizes */
+  .text-responsive-xs {
+    @apply text-xs sm:text-sm;
+  }
+  
+  .text-responsive-sm {
+    @apply text-sm sm:text-base;
+  }
+  
+  .text-responsive-base {
+    @apply text-base sm:text-lg;
+  }
+  
+  .text-responsive-lg {
+    @apply text-lg sm:text-xl;
+  }
+  
+  .text-responsive-xl {
+    @apply text-xl sm:text-2xl;
+  }
+  
+  .text-responsive-2xl {
+    @apply text-2xl sm:text-3xl;
+  }
+  
+  /* Safe area padding for notched devices */
+  .safe-area-inset-top {
+    padding-top: env(safe-area-inset-top);
+  }
+  
+  .safe-area-inset-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  
+  /* Prevent text selection on touch */
+  .no-select-mobile {
+    @apply select-none sm:select-auto;
+  }
+  
+  /* Screen reader only - visually hidden but accessible */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+  
+  .sr-only:focus,
+  .sr-only:active {
+    position: static;
+    width: auto;
+    height: auto;
+    padding: inherit;
+    margin: inherit;
+    overflow: visible;
+    clip: auto;
+    white-space: normal;
+  }
+  
+  /* Focus visible styles for keyboard navigation */
+  .focus-visible-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2;
+  }
+  
+  /* High contrast mode support */
+  @media (prefers-contrast: high) {
+    * {
+      border-color: currentColor !important;
+    }
+  }
+  
+  /* Reduced motion support */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
